@@ -1,0 +1,1134 @@
+#!/usr/bin/env python3
+# pylint: disable=too-many-lines  # single-file script; length is mostly docstrings
+"""Vim-navigable ncurses browser for radio/SoundCloud stations, playing via ffplay."""
+
+import argparse
+import curses
+import json
+import locale
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import tomllib
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+BUNDLED_CONFIG = Path(__file__).resolve().parent / "stations.toml"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "bbplayer"
+DEFAULT_CONFIG = CONFIG_DIR / "stations.toml"
+
+APP_NAME = "BLiTzBLiT Player"
+APP_VERSION = "v1.0.0"
+APP_BRAND = f"{APP_NAME} {APP_VERSION}"
+
+
+def supports_unicode():
+    """Check whether the terminal can reliably render Braille glyphs.
+
+    Returns
+    -------
+    bool
+        True if the locale's preferred encoding is UTF-8 and the terminal
+        is not the raw Linux virtual console (``TERM=linux``), which usually
+        lacks Braille glyphs in its default font even under a UTF-8 locale.
+    """
+    # TERM=linux is the raw Linux virtual console: even under a UTF-8 locale
+    # its default font usually lacks Braille glyphs, so always fall back there.
+    if os.environ.get("TERM") == "linux":
+        return False
+    return locale.getpreferredencoding().lower().startswith("utf")
+
+
+UNICODE_OK = supports_unicode()
+BAR_FILLED = "⣿" if UNICODE_OK else "#"
+BAR_EMPTY = "⠒" if UNICODE_OK else "-"
+
+STATUS_LINE_RE = re.compile(r"^\s*(\d+\.\d+)\s+\S*-\S*:")
+
+TAPE_PATTERN = BAR_FILLED * 2 + BAR_EMPTY * 6
+TAPE_STEP_SECONDS = 0.5
+
+LABEL_COL = 16
+DATE_COL = 10
+DURATION_COL = 8
+
+STATIONS_EXAMPLE = """Example stations.toml:
+
+[[station]]
+label = "Radio Example"
+url = "https://stream.example.com/radio.mp3"
+
+[[station]]
+label = "My SoundCloud Channel"
+url = "https://soundcloud.com/someartist/tracks"
+"""
+
+
+class ConfigError(Exception):
+    """Raised when the stations config file is missing, empty, or invalid."""
+
+
+def load_stations(path):
+    """Load and validate the station list from a TOML config file.
+
+    Parameters
+    ----------
+    path : pathlib.Path or str
+        Path to the ``stations.toml`` file.
+
+    Returns
+    -------
+    list of dict
+        Each dict has at least ``label`` and ``url`` keys, in file order.
+
+    Raises
+    ------
+    OSError
+        If the file cannot be opened.
+    tomllib.TOMLDecodeError
+        If the file is not valid TOML.
+    ValueError
+        If a ``[[station]]`` entry is missing ``label`` or ``url``.
+    """
+    with open(path, "rb") as f:
+        data = tomllib.load(f)
+    stations = data.get("station", [])
+    for entry in stations:
+        if "label" not in entry or "url" not in entry:
+            raise ValueError(f"station entry missing 'label' or 'url': {entry}")
+    return stations
+
+
+def is_soundcloud_url(url):
+    """Check whether a station URL points at SoundCloud.
+
+    Parameters
+    ----------
+    url : str
+        The station's configured URL.
+
+    Returns
+    -------
+    bool
+        True if the URL's host is SoundCloud.
+    """
+    return "soundcloud.com" in url.lower()
+
+
+def format_date(upload_date):
+    """Format a yt-dlp ``upload_date`` string as ``YYYY-MM-DD``.
+
+    Parameters
+    ----------
+    upload_date : str or None
+        An 8-character date string in ``YYYYMMDD`` form, as returned by
+        yt-dlp, or None/empty if unknown.
+
+    Returns
+    -------
+    str
+        The formatted date, or ``"----------"`` if `upload_date` is
+        missing or not 8 characters long.
+    """
+    if not upload_date or len(upload_date) != 8:
+        return "----------"
+    return f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]}"
+
+
+def format_duration(seconds):
+    """Format a duration in seconds as ``M:SS`` or ``H:MM:SS``.
+
+    Parameters
+    ----------
+    seconds : float, int, or None
+        Duration in seconds, or None if unknown.
+
+    Returns
+    -------
+    str
+        ``"--:--"`` if `seconds` is None, ``"M:SS"`` for durations under an
+        hour, or ``"H:MM:SS"`` otherwise.
+    """
+    if seconds is None:
+        return "--:--"
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    return f"{minutes}:{seconds:02d}"
+
+
+def fetch_tracks(channel_url, limit):
+    """Fetch metadata for the most recent tracks on a SoundCloud channel.
+
+    Parameters
+    ----------
+    channel_url : str
+        URL of the SoundCloud channel's tracks (or playlist) page.
+    limit : int
+        Maximum number of most recent tracks to fetch. Full (non-flat)
+        yt-dlp extraction is used to get duration/date, which is slow per
+        track, so this caps how many network requests are made.
+
+    Returns
+    -------
+    list of dict
+        Track dicts with ``title``, ``url``, ``timestamp``, ``date``,
+        ``duration`` (formatted string), and ``duration_secs`` (raw
+        seconds, or None if unknown), sorted newest first.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If yt-dlp fails (network error, invalid channel, etc.).
+    """
+    proc = subprocess.run(
+        ["yt-dlp", "-j", "--playlist-end", str(limit), channel_url],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    tracks = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            continue
+        data = json.loads(line)
+        tracks.append(
+            {
+                "title": data.get("title") or "(untitled)",
+                "url": data["webpage_url"],
+                "timestamp": data.get("timestamp") or 0,
+                "date": format_date(data.get("upload_date")),
+                "duration": format_duration(data.get("duration")),
+                "duration_secs": data.get("duration"),
+            }
+        )
+    tracks.sort(key=lambda t: t["timestamp"], reverse=True)
+    return tracks
+
+
+def resolve_stream_url(track_url):
+    """Resolve a SoundCloud track page URL to a direct audio stream URL.
+
+    Prefers a progressive (non-HLS) format: SoundCloud's HLS streams make
+    ffplay fetch a new segment every few seconds, which causes audible
+    stutter/silence at segment boundaries. A plain http stream avoids that.
+
+    Parameters
+    ----------
+    track_url : str
+        URL of the SoundCloud track's webpage.
+
+    Returns
+    -------
+    str
+        Direct, signed URL to the audio stream.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If yt-dlp fails to resolve the URL.
+    """
+    proc = subprocess.run(
+        ["yt-dlp", "-f", "bestaudio[protocol=http]/bestaudio", "-g", track_url],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return proc.stdout.strip().splitlines()[0]
+
+
+def download_track(url, dest_path):
+    """Download a track to a local file, verifying it isn't truncated.
+
+    SoundCloud tracks are small (a few MB); downloading up front avoids
+    ffplay's real-time HTTP stream getting cut off mid-track by the CDN.
+    The CDN has occasionally served a short read on a cold cache entry, so
+    the download is verified against ``Content-Length`` rather than trusted
+    blindly.
+
+    Parameters
+    ----------
+    url : str
+        Direct stream URL, as returned by `resolve_stream_url`.
+    dest_path : str or pathlib.Path
+        Local file path to write the download to.
+
+    Raises
+    ------
+    OSError
+        If the download is shorter than the server's advertised
+        ``Content-Length`` (the partial file is removed before raising).
+    """
+    with urllib.request.urlopen(url) as response:
+        expected = response.length
+        with open(dest_path, "wb") as out:
+            shutil.copyfileobj(response, out)
+
+    actual = os.path.getsize(dest_path)
+    if expected is not None and actual != expected:
+        os.remove(dest_path)
+        raise OSError(f"incomplete download: got {actual} of {expected} bytes")
+
+
+def prepare_track(track, attempts=3):
+    """Resolve and download a track to a temp file, retrying on failure.
+
+    The CDN occasionally serves a short read on a cold cache entry (caught
+    by the ``Content-Length`` check in `download_track`); this retries a
+    few times against the same resolved URL before giving up.
+
+    Parameters
+    ----------
+    track : dict
+        Track dict as returned by `fetch_tracks`; only ``url`` is used.
+    attempts : int, optional
+        Number of download attempts before giving up (default 3).
+
+    Returns
+    -------
+    str
+        Path to the downloaded temp file (caller is responsible for
+        deleting it; see `Player.stop`).
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If yt-dlp fails to resolve the stream URL.
+    OSError
+        If all download attempts result in an incomplete file.
+    """
+    stream_url = resolve_stream_url(track["url"])
+    last_error = None
+    for _ in range(attempts):
+        fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="bbplayer_")
+        os.close(fd)
+        try:
+            download_track(stream_url, temp_path)
+            return temp_path
+        except OSError as exc:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+            last_error = exc
+    raise last_error
+
+
+class Player:
+    """Manage a background ``ffplay`` process and track its playback position.
+
+    Attributes
+    ----------
+    proc : subprocess.Popen or None
+        The running ffplay process, or None if nothing is playing.
+    title : str or None
+        Title of the currently playing item.
+    elapsed : float
+        Seconds into the current stream, parsed live from ffplay's stderr
+        status line.
+    temp_path : str or None
+        Path to a downloaded temp file to delete on `stop`, if any.
+    """
+
+    def __init__(self):
+        """Create a Player with nothing loaded or playing."""
+        self.proc = None
+        self.title = None
+        self.elapsed = 0.0
+        self._reader_thread = None
+        self.temp_path = None
+
+    def play(self, stream_url, title, temp_path=None):
+        """Stop any current playback and start playing a new stream.
+
+        Parameters
+        ----------
+        stream_url : str
+            URL or local file path for ffplay to play.
+        title : str
+            Display title for the now-playing screen.
+        temp_path : str or None, optional
+            Path to a downloaded temp file that should be deleted once
+            playback stops (see `stop`). None for live/streamed URLs that
+            aren't backed by a temp file.
+        """
+        self.stop()
+        # No -loglevel quiet: ffplay's stderr status line ("12.34 M-A: ...")
+        # is how we read live playback position without a real IPC channel.
+        # Process outlives this method (managed via stop()/is_playing()), so
+        # a `with` block here would kill it as soon as play() returns.
+        self.proc = subprocess.Popen(  # pylint: disable=consider-using-with
+            ["ffplay", "-nodisp", "-autoexit", stream_url],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        self.title = title
+        self.elapsed = 0.0
+        self.temp_path = temp_path
+        self._reader_thread = threading.Thread(target=self._read_progress, daemon=True)
+        self._reader_thread.start()
+
+    def _read_progress(self):
+        """Continuously parse ffplay's stderr for its playback position.
+
+        Runs in a background thread started by `play`; updates
+        `self.elapsed` as each new status line arrives. Returns when
+        ffplay's stderr closes (process exited).
+        """
+        proc = self.proc
+        try:
+            for line in proc.stderr:
+                match = STATUS_LINE_RE.match(line)
+                if match:
+                    self.elapsed = float(match.group(1))
+        except ValueError, OSError:
+            pass
+
+    def stop(self):
+        """Terminate any running ffplay process and clean up its temp file."""
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+        self.proc = None
+        self.title = None
+        self.elapsed = 0.0
+        if self.temp_path:
+            try:
+                os.remove(self.temp_path)
+            except OSError:
+                pass
+            self.temp_path = None
+
+    def is_playing(self):
+        """Check whether ffplay is currently running.
+
+        Returns
+        -------
+        bool
+            True if a playback process is running.
+        """
+        return self.proc is not None and self.proc.poll() is None
+
+
+def tape_scroll(width):
+    """Render one animation frame of a "tape deck" scrolling bar.
+
+    The `TAPE_PATTERN` repeats across `width` columns and shifts one
+    character to the right every `TAPE_STEP_SECONDS`, looping forever, based
+    on the wall clock (so redraw timing doesn't affect the animation speed).
+
+    Parameters
+    ----------
+    width : int
+        Number of characters to render.
+
+    Returns
+    -------
+    str
+        A string of exactly `width` characters (empty if `width` <= 0).
+    """
+    if width <= 0:
+        return ""
+    period = len(TAPE_PATTERN)
+    step = int(time.time() / TAPE_STEP_SECONDS) % period
+    repeated = TAPE_PATTERN * (width // period + 2)
+    start = (period - step) % period
+    return repeated[start : start + width]
+
+
+def format_row(col1, col2, title, width):
+    """Format a fixed-width ``DATE  LENGTH  TITLE``-style table row.
+
+    Parameters
+    ----------
+    col1 : str
+        Text for the first (date-width) column.
+    col2 : str
+        Text for the second (duration-width) column.
+    title : str
+        Text for the remaining space; truncated to fit `width`.
+    width : int
+        Total terminal width available for the row.
+
+    Returns
+    -------
+    str
+        The formatted row.
+    """
+    title_width = max(width - DATE_COL - DURATION_COL - 2, 0)
+    return f"{col1:<{DATE_COL}} {col2:<{DURATION_COL}} {title[:title_width]}"
+
+
+def draw_status_bar(stdscr, y, width, status):
+    """Draw a left-aligned status/hint line, never truncating it for brand text.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    y : int
+        Row to draw on.
+    width : int
+        Terminal width, used to avoid writing past the last column.
+    status : str
+        Status/hint text to display.
+    """
+    avail = max(width - 1, 0)
+    stdscr.addnstr(y, 0, status[:avail], avail, curses.A_BOLD)
+
+
+def draw_top_right(stdscr, y, width, text, existing_len=0):
+    """Draw dimmed text right-aligned on a row, if there's room for it.
+
+    Decorative brand text: only drawn if there's a gap to the right of the
+    existing row content; never truncates that content to make room.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    y : int
+        Row to draw on.
+    width : int
+        Terminal width, used to compute the right-aligned column.
+    text : str
+        Text to draw (e.g. `APP_BRAND`).
+    existing_len : int, optional
+        Length of content already drawn on this row starting at column 0;
+        `text` is skipped entirely if it would overlap that content.
+    """
+    avail = max(width - 1, 0)
+    x = avail - len(text)
+    if x > existing_len:
+        stdscr.addnstr(y, x, text, avail - x, curses.A_DIM)
+
+
+def draw_stations(stdscr, stations, selected, top, status):
+    """Render the station-list screen.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    stations : list of dict
+        Station dicts with ``label`` and ``url`` keys.
+    selected : int
+        Index of the currently highlighted station.
+    top : int
+        Index of the first visible row (for scrolling); may be adjusted
+        to keep `selected` in view.
+    status : str
+        Status/hint text for the bottom bar.
+
+    Returns
+    -------
+    int
+        The (possibly adjusted) scroll offset; pass this back in as `top`
+        on the next call.
+    """
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    list_height = height - 3
+
+    if selected < top:
+        top = selected
+    elif selected >= top + list_height:
+        top = selected - list_height + 1
+
+    header = f"{'KIND':<{LABEL_COL}} LABEL"
+    stdscr.addnstr(0, 0, header[: width - 1], width - 1, curses.A_UNDERLINE)
+    draw_top_right(stdscr, 0, width, APP_BRAND, len(header))
+
+    for row in range(list_height):
+        idx = top + row
+        if idx >= len(stations):
+            break
+        station = stations[idx]
+        kind = "soundcloud" if is_soundcloud_url(station["url"]) else "radio"
+        line = f"{kind:<{LABEL_COL}} {station['label']}"
+        attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
+        stdscr.addnstr(row + 1, 0, line[: width - 1], width - 1, attr)
+
+    draw_status_bar(stdscr, height - 1, width, status)
+    stdscr.refresh()
+    return top
+
+
+def draw_tracks(stdscr, tracks, selected, top, status):
+    """Render the track-list screen for a SoundCloud channel.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    tracks : list of dict
+        Track dicts as returned by `fetch_tracks`.
+    selected : int
+        Index of the currently highlighted track.
+    top : int
+        Index of the first visible row (for scrolling); may be adjusted
+        to keep `selected` in view.
+    status : str
+        Status/hint text for the bottom bar.
+
+    Returns
+    -------
+    int
+        The (possibly adjusted) scroll offset; pass this back in as `top`
+        on the next call.
+    """
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    list_height = height - 3
+
+    if selected < top:
+        top = selected
+    elif selected >= top + list_height:
+        top = selected - list_height + 1
+
+    header = format_row("DATE", "LENGTH", "TITLE", width)
+    stdscr.addnstr(0, 0, header[: width - 1], width - 1, curses.A_UNDERLINE)
+    draw_top_right(stdscr, 0, width, APP_BRAND, len(header))
+
+    for row in range(list_height):
+        idx = top + row
+        if idx >= len(tracks):
+            break
+        track = tracks[idx]
+        line = format_row(track["date"], track["duration"], track["title"], width)
+        attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
+        stdscr.addnstr(row + 1, 0, line[: width - 1], width - 1, attr)
+
+    draw_status_bar(stdscr, height - 1, width, status)
+    stdscr.refresh()
+    return top
+
+
+def draw_playing(stdscr, item, player, status):
+    """Render the now-playing screen: title, date, and a timeline/tape bar.
+
+    Shows a filled progress bar with elapsed/total time for items with a
+    known duration (SoundCloud tracks), or a looping "tape deck" scroll
+    animation with just an elapsed timer for live/infinite streams (radio).
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    item : dict
+        The now-playing item; needs ``title``, and optionally ``date``,
+        ``duration`` (formatted string), and ``duration_secs`` (raw
+        seconds, or falsy/absent for live streams).
+    player : Player
+        The active player, used to read `Player.elapsed`.
+    status : str
+        Status/hint text for the bottom bar.
+    """
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+
+    title = item["title"]
+    stdscr.addnstr(0, 0, title[: width - 1], width - 1, curses.A_BOLD)
+    draw_top_right(stdscr, 0, width, APP_BRAND, len(title))
+    stdscr.addnstr(1, 0, item.get("date", "")[: width - 1], width - 1)
+
+    elapsed_str = format_duration(player.elapsed)
+    duration_secs = item.get("duration_secs")
+    avail = max(width - 1, 1)
+
+    if duration_secs:
+        total_str = item["duration"]
+        bar_width = max(avail - len(elapsed_str) - len(total_str) - 4, 1)
+        filled = int(min(player.elapsed / duration_secs, 1.0) * bar_width)
+        bar_str = BAR_FILLED * filled + BAR_EMPTY * (bar_width - filled)
+        timeline = f"{elapsed_str} [{bar_str}] {total_str}"
+    else:
+        bar_width = max(avail - len(elapsed_str) - 6, 1)
+        bar_str = tape_scroll(bar_width)
+        timeline = f"{elapsed_str} [{bar_str}] LIVE"
+
+    stdscr.addnstr(3, 0, timeline[:avail], avail)
+
+    draw_status_bar(stdscr, height - 1, width, status)
+    stdscr.refresh()
+
+
+def track_hint(count, continuous):
+    """Build the status/hint line for the track-list screen.
+
+    Parameters
+    ----------
+    count : int
+        Number of tracks in the list.
+    continuous : bool
+        Current continuous-play toggle state, shown as ON/OFF.
+
+    Returns
+    -------
+    str
+        The formatted hint line.
+    """
+    state = "ON" if continuous else "OFF"
+    return f"{count} tracks | j/k move, gg/G top/bottom, Enter play, c continuous:{state}, b back, q quit"
+
+
+def playing_hint(continuous, back_view):
+    """Build the status/hint line for the now-playing screen.
+
+    Parameters
+    ----------
+    continuous : bool
+        Current continuous-play toggle state, shown as ON/OFF.
+    back_view : str
+        The view to return to on ``b``/stop (``"stations"`` or
+        ``"tracks"``); the continuous-play hint is only shown when this is
+        ``"tracks"``, since it doesn't apply to live radio.
+
+    Returns
+    -------
+    str
+        The formatted hint line.
+    """
+    if back_view == "tracks":
+        state = "ON" if continuous else "OFF"
+        return f"b back, x stop, continuous:{state}, q quit"
+    return "b back, x stop, q quit"
+
+
+@dataclass
+class AppState:  # pylint: disable=too-many-instance-attributes
+    """Shared mutable state for the stations/tracks/playing view loop.
+
+    Attributes
+    ----------
+    stations : list of dict
+        All configured stations, loaded once at startup.
+    view : str
+        Current screen: ``"stations"``, ``"tracks"``, or ``"playing"``.
+    station_selected : int
+        Index of the highlighted station in the stations screen.
+    station_top : int
+        Scroll offset for the stations screen.
+    station_status : str
+        Status/hint text for the stations screen.
+    tracks : list of dict
+        Tracks fetched for the currently browsed SoundCloud station.
+    track_selected : int
+        Index of the highlighted track in the tracks screen.
+    track_top : int
+        Scroll offset for the tracks screen.
+    track_status : str
+        Status/hint text for the tracks screen.
+    now_playing : dict or None
+        The item currently loaded in the player, or None.
+    playing_status : str
+        Status/hint text for the playing screen.
+    back_view : str
+        View to return to from the playing screen (``"stations"`` or
+        ``"tracks"``), set when playback starts.
+    pending_g : bool
+        True after a single ``g`` keypress, awaiting a second ``g`` to
+        complete the vim-style ``gg`` (jump to top) sequence.
+    continuous : bool
+        Whether finished tracks should auto-advance to the next one.
+    """
+
+    stations: list
+    view: str = "stations"
+    station_selected: int = 0
+    station_top: int = 0
+    station_status: str = ""
+
+    tracks: list = field(default_factory=list)
+    track_selected: int = 0
+    track_top: int = 0
+    track_status: str = ""
+
+    now_playing: dict | None = None
+    playing_status: str = ""
+    back_view: str = "stations"
+    pending_g: bool = False
+    continuous: bool = False
+
+    def __post_init__(self):
+        """Fill in `station_status` now that `stations` is known."""
+        self.station_status = (
+            f"{len(self.stations)} stations | j/k move, gg/G top/bottom, " "Enter select, v now-playing, q quit"
+        )
+
+
+def select_station(stdscr, state, player, limit):
+    """Handle Enter on the stations screen: fetch tracks or play live radio.
+
+    If the selected station is a SoundCloud URL, fetches its tracks and
+    switches `state.view` to ``"tracks"``. Otherwise, starts playing the
+    station directly as a live stream and switches to ``"playing"``.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into while fetching (shows a status message).
+    state : AppState
+        Mutable app state; updated in place.
+    player : Player
+        The active player, used to start live-radio playback.
+    limit : int
+        Max number of tracks to fetch, passed through to `fetch_tracks`.
+    """
+    station = state.stations[state.station_selected]
+    if is_soundcloud_url(station["url"]):
+        state.station_status = f"Fetching tracks: {station['label']}..."
+        draw_stations(stdscr, state.stations, state.station_selected, state.station_top, state.station_status)
+        try:
+            state.tracks = fetch_tracks(station["url"], limit)
+            state.track_selected = 0
+            state.track_top = 0
+            state.track_status = track_hint(len(state.tracks), state.continuous)
+            state.view = "tracks"
+        except subprocess.CalledProcessError as exc:
+            state.station_status = f"Failed to fetch tracks: {exc.stderr}"
+    else:
+        player.play(station["url"], station["label"])
+        state.now_playing = {
+            "title": station["label"],
+            "date": "",
+            "duration": "",
+            "duration_secs": None,
+        }
+        state.playing_status = "b back, x stop, q quit"
+        state.back_view = "stations"
+        state.view = "playing"
+
+
+def handle_stations_view(stdscr, state, player, limit):
+    """Draw the stations screen and handle one keypress on it.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    state : AppState
+        Mutable app state; updated in place based on the key pressed.
+    player : Player
+        The active player, used for the ``v``/``x`` keys.
+    limit : int
+        Max tracks to fetch if a SoundCloud station is selected, passed
+        through to `select_station`.
+
+    Returns
+    -------
+    bool
+        False if ``q`` was pressed (caller should quit the app), True
+        otherwise (keep running).
+    """
+    stdscr.timeout(-1)
+    state.station_top = draw_stations(
+        stdscr, state.stations, state.station_selected, state.station_top, state.station_status
+    )
+    key = stdscr.getch()
+
+    if key in (ord("j"), curses.KEY_DOWN):
+        state.station_selected = min(state.station_selected + 1, len(state.stations) - 1)
+        state.pending_g = False
+    elif key in (ord("k"), curses.KEY_UP):
+        state.station_selected = max(state.station_selected - 1, 0)
+        state.pending_g = False
+    elif key == ord("g"):
+        state.station_selected = 0 if state.pending_g else state.station_selected
+        state.pending_g = not state.pending_g
+    elif key == ord("G"):
+        state.station_selected = len(state.stations) - 1
+        state.pending_g = False
+    elif key in (curses.KEY_ENTER, 10, 13):
+        state.pending_g = False
+        select_station(stdscr, state, player, limit)
+    elif key == ord("v") and player.is_playing():
+        state.pending_g = False
+        state.playing_status = playing_hint(state.continuous, state.back_view)
+        state.view = "playing"
+    elif key == ord("x"):
+        state.pending_g = False
+        player.stop()
+        state.station_status = "Stopped"
+    elif key == ord("q"):
+        return False
+    else:
+        state.pending_g = False
+    return True
+
+
+def play_track(stdscr, state, player, track):
+    """Download and start playing a track selected from the tracks screen.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into while downloading (shows a status message).
+    state : AppState
+        Mutable app state; updated in place.
+    player : Player
+        The active player, used to start playback.
+    track : dict
+        The track to play, as returned by `fetch_tracks`.
+    """
+    state.track_status = f"Downloading: {track['title']}"
+    draw_tracks(stdscr, state.tracks, state.track_selected, state.track_top, state.track_status)
+    try:
+        temp_path = prepare_track(track)
+        player.play(temp_path, track["title"], temp_path=temp_path)
+        state.now_playing = track
+        state.playing_status = playing_hint(state.continuous, "tracks")
+        state.back_view = "tracks"
+        state.view = "playing"
+    except subprocess.CalledProcessError, OSError:
+        state.track_status = f"Failed to download: {track['title']}"
+
+
+def handle_tracks_view(stdscr, state, player):
+    """Draw the tracks screen and handle one keypress on it.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    state : AppState
+        Mutable app state; updated in place based on the key pressed.
+    player : Player
+        The active player, used for the ``v``/``x`` keys.
+
+    Returns
+    -------
+    bool
+        False if ``q`` was pressed (caller should quit the app), True
+        otherwise (keep running).
+    """
+    stdscr.timeout(-1)
+    state.track_top = draw_tracks(stdscr, state.tracks, state.track_selected, state.track_top, state.track_status)
+    key = stdscr.getch()
+
+    if key in (ord("j"), curses.KEY_DOWN):
+        state.track_selected = min(state.track_selected + 1, len(state.tracks) - 1)
+        state.pending_g = False
+    elif key in (ord("k"), curses.KEY_UP):
+        state.track_selected = max(state.track_selected - 1, 0)
+        state.pending_g = False
+    elif key == ord("g"):
+        state.track_selected = 0 if state.pending_g else state.track_selected
+        state.pending_g = not state.pending_g
+    elif key == ord("G"):
+        state.track_selected = len(state.tracks) - 1
+        state.pending_g = False
+    elif key in (curses.KEY_ENTER, 10, 13):
+        state.pending_g = False
+        play_track(stdscr, state, player, state.tracks[state.track_selected])
+    elif key == ord("c"):
+        state.pending_g = False
+        state.continuous = not state.continuous
+        state.track_status = track_hint(len(state.tracks), state.continuous)
+    elif key == ord("v") and player.is_playing():
+        state.pending_g = False
+        state.playing_status = playing_hint(state.continuous, state.back_view)
+        state.view = "playing"
+    elif key == ord("x"):
+        state.pending_g = False
+        player.stop()
+        state.track_status = "Stopped"
+    elif key in (ord("b"), 27):
+        state.pending_g = False
+        state.view = "stations"
+    elif key == ord("q"):
+        return False
+    else:
+        state.pending_g = False
+    return True
+
+
+def advance_or_finish(stdscr, state, player):
+    """Handle a track finishing: auto-advance if continuous play is on.
+
+    Called from `handle_playing_view` once `player.is_playing()` goes
+    False. If continuous play is enabled, we're playing from a track list,
+    and a next track exists, downloads and plays it. Otherwise, marks
+    playback as finished.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into while downloading the next track.
+    state : AppState
+        Mutable app state; updated in place.
+    player : Player
+        The active player, used to start the next track.
+    """
+    can_advance = state.continuous and state.back_view == "tracks" and state.track_selected + 1 < len(state.tracks)
+    if not can_advance:
+        state.playing_status = f"Finished | {playing_hint(state.continuous, state.back_view)}"
+        return
+
+    state.track_selected += 1
+    next_track = state.tracks[state.track_selected]
+    state.playing_status = f"Downloading: {next_track['title']}"
+    draw_playing(stdscr, state.now_playing, player, state.playing_status)
+    try:
+        temp_path = prepare_track(next_track)
+        player.play(temp_path, next_track["title"], temp_path=temp_path)
+        state.now_playing = next_track
+        state.playing_status = playing_hint(state.continuous, state.back_view)
+    except subprocess.CalledProcessError, OSError:
+        state.track_status = f"Failed to download: {next_track['title']}"
+        state.now_playing = None
+        state.view = "tracks"
+
+
+def handle_playing_view(stdscr, state, player):
+    """Draw the now-playing screen and handle one keypress on it.
+
+    Also checks whether playback has finished (polled every 200ms) and
+    delegates to `advance_or_finish` if so.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    state : AppState
+        Mutable app state; updated in place based on the key pressed.
+    player : Player
+        The active player.
+
+    Returns
+    -------
+    bool
+        False if ``q`` was pressed (caller should quit the app), True
+        otherwise (keep running).
+    """
+    stdscr.timeout(200)
+    if not player.is_playing() and state.now_playing is not None:
+        advance_or_finish(stdscr, state, player)
+
+    if state.view != "playing":
+        return True
+
+    draw_playing(stdscr, state.now_playing, player, state.playing_status)
+    key = stdscr.getch()
+
+    if key in (ord("b"), 27, curses.KEY_ENTER, 10, 13):
+        state.view = state.back_view
+    elif key == ord("x"):
+        player.stop()
+        state.view = state.back_view
+    elif key == ord("c") and state.back_view == "tracks":
+        state.continuous = not state.continuous
+        state.playing_status = playing_hint(state.continuous, state.back_view)
+    elif key == ord("q"):
+        return False
+    return True
+
+
+def run_view(stdscr, state, player, limit):
+    """Dispatch to the handler for the current view.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    state : AppState
+        Mutable app state; `state.view` selects which handler runs.
+    player : Player
+        The active player, passed through to the handler.
+    limit : int
+        Max tracks to fetch, passed through to `handle_stations_view`.
+
+    Returns
+    -------
+    bool
+        False if the app should quit, True to keep running.
+    """
+    if state.view == "stations":
+        return handle_stations_view(stdscr, state, player, limit)
+    if state.view == "tracks":
+        return handle_tracks_view(stdscr, state, player)
+    return handle_playing_view(stdscr, state, player)
+
+
+def main(stdscr, config_path, limit):
+    """Run the app's main event loop.
+
+    Loads the station config, then repeatedly dispatches to the current
+    view's handler via `run_view` until the user quits.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        The root window, provided by `curses.wrapper`.
+    config_path : pathlib.Path
+        Path to the ``stations.toml`` file to load.
+    limit : int
+        Max number of tracks to fetch per SoundCloud station.
+
+    Raises
+    ------
+    ConfigError
+        If the config file is missing, empty, or fails to parse.
+    """
+    curses.curs_set(0)
+    stdscr.keypad(True)
+
+    try:
+        stations = load_stations(config_path)
+    except FileNotFoundError:
+        raise ConfigError(f"No stations file found at {config_path}\n\n{STATIONS_EXAMPLE}") from None
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        raise ConfigError(f"Failed to load {config_path}: {exc}\n\n{STATIONS_EXAMPLE}") from None
+
+    if not stations:
+        raise ConfigError(f"No stations defined in {config_path}\n\n{STATIONS_EXAMPLE}")
+
+    state = AppState(stations)
+    player = Player()
+
+    try:
+        while run_view(stdscr, state, player, limit):
+            pass
+    finally:
+        player.stop()
+
+
+if __name__ == "__main__":
+    locale.setlocale(locale.LC_ALL, "")  # let ncursesw render multi-byte UTF-8 correctly
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not DEFAULT_CONFIG.exists() and BUNDLED_CONFIG.exists():
+        shutil.copy(BUNDLED_CONFIG, DEFAULT_CONFIG)
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_CONFIG,
+        help=f"Path to stations TOML file (default: {DEFAULT_CONFIG})",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=50,
+        help="Number of most recent tracks to fetch per SoundCloud station (default: 50)",
+    )
+    args = parser.parse_args()
+
+    for tool in ("yt-dlp", "ffplay"):
+        if shutil.which(tool) is None:
+            print(f"Required tool not found: {tool}", file=sys.stderr)
+            sys.exit(1)
+
+    try:
+        curses.wrapper(main, args.config, args.limit)
+    except ConfigError as exc:
+        print(exc, file=sys.stderr)
+        sys.exit(1)

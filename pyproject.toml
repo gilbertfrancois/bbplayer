@@ -1,0 +1,40 @@
+[tool.poetry]
+name = "bbplayer"
+version = "1.0.0"
+description = ""
+authors = ["Gilbert Francois Duivesteijn <info@gilbertfrancois.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.14,<3.15"
+
+
+[tool.poetry.group.dev.dependencies]
+pylint = "^4.0.6"
+black = "^26.5.1"
+isort = "^8.0.1"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 120
+target-version = ["py314"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+py_version = 314
+
+[tool.pylint.main]
+py-version = "3.14"
+disable = ["raw-checker-failed", "bad-inline-option", "locally-disabled", "file-ignored", "suppressed-message", "useless-suppression", "deprecated-pragma", "use-symbolic-message-instead", "line-too-long", "missing-function-docstring", "missing-class-docstring", "missing-module-docstring"]
+good-names = ["Run", "_", "a", "b", "c", "d", "e", "ex", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+output-format = "colorized"
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    "ignore::DeprecationWarning:google\\.protobuf\\..*"
+]
+

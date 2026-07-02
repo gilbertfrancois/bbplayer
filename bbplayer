@@ -830,7 +830,15 @@ def draw_panel_border(stdscr, y, x, height, width):
 
 
 def draw_stations(stdscr, stations, selected, top, status):
-    """Render the station-list screen.
+    """Render the station-list screen: a bordered pane with a header and a
+    scrollable list, in the same style as the now-playing panel.
+
+    The pane shrinks to fit and centers vertically when the station list
+    is short, or grows to fill the available height (scrolling) when it
+    isn't — the same sizing behavior as the now-playing panel. The
+    brand/version stays top-right of row 0, above the pane, and the
+    status/hint bar stays on the last row, below it — both in the same
+    position as on the now-playing screen.
 
     Parameters
     ----------
@@ -854,16 +862,32 @@ def draw_stations(stdscr, stations, selected, top, status):
     """
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    list_height = height - 3
 
+    panel_width = min(max(width - 4, 20), max(width - 2, 1))
+    content_width = max(panel_width - 4, 1)
+    panel_x = max((width - panel_width) // 2, 0)
+    desired_height = 2 + 1 + len(stations)
+    if height >= 4:
+        # Row 0 (brand) and the last row (status bar) are always kept free.
+        usable_height = max(height - 2, 1)
+        panel_height = min(desired_height, usable_height)
+        panel_y = 1 + max((usable_height - panel_height) // 2, 0)
+    else:
+        panel_y = 0
+        panel_height = max(height - 1, 1)
+
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_top_right(stdscr, 0, width, APP_BRAND)
+
+    list_height = max(panel_height - 3, 0)
     if selected < top:
         top = selected
     elif selected >= top + list_height:
         top = selected - list_height + 1
 
-    header = f"{'KIND':<{LABEL_COL}} LABEL"
-    stdscr.addnstr(0, 0, header[: width - 1], width - 1, curses.A_UNDERLINE)
-    draw_top_right(stdscr, 0, width, APP_BRAND, len(header))
+    header = f"{'KIND':<{LABEL_COL}} LABEL".ljust(content_width)
+    if panel_y + 1 < height:
+        stdscr.addnstr(panel_y + 1, panel_x + 2, header[:content_width], content_width, curses.A_UNDERLINE)
 
     for row in range(list_height):
         idx = top + row
@@ -873,7 +897,7 @@ def draw_stations(stdscr, stations, selected, top, status):
         kind = "soundcloud" if is_soundcloud_url(station["url"]) else "radio"
         line = f"{kind:<{LABEL_COL}} {station['label']}"
         attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
-        stdscr.addnstr(row + 1, 0, line[: width - 1], width - 1, attr)
+        stdscr.addnstr(panel_y + 2 + row, panel_x + 2, line[:content_width], content_width, attr)
 
     draw_status_bar(stdscr, height - 1, width, status)
     stdscr.refresh()

@@ -29,6 +29,7 @@ continuous auto-advance for SoundCloud track lists with c.
 
 import argparse
 import curses
+import hashlib
 import json
 import locale
 import os
@@ -48,6 +49,7 @@ from pathlib import Path
 BUNDLED_CONFIG = Path(__file__).resolve().parent / "stations.toml"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "bbplayer"
 DEFAULT_CONFIG = CONFIG_DIR / "stations.toml"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "bbplayer"
 
 APP_NAME = "BLiTzBLiT Player"
 APP_VERSION = "v0.2.0"
@@ -287,6 +289,95 @@ def fetch_tracks(channel_url, limit):
     return tracks
 
 
+def cache_path_for_station(station):
+    """Compute the on-disk cache file for a SoundCloud station's track list.
+
+    Parameters
+    ----------
+    station : dict
+        Station dict with a ``url`` key.
+
+    Returns
+    -------
+    pathlib.Path
+        A path under `CACHE_DIR`, named from a hash of the station's URL
+        (so it survives label renames and needs no filename sanitizing).
+    """
+    digest = hashlib.sha256(station["url"].encode("utf-8")).hexdigest()[:16]
+    return CACHE_DIR / f"{digest}.json"
+
+
+def load_cached_tracks(station):
+    """Load a station's previously cached track list, if any.
+
+    Parameters
+    ----------
+    station : dict
+        Station dict with a ``url`` key.
+
+    Returns
+    -------
+    list of dict or None
+        The cached tracks, or None if there's no cache yet or it can't be
+        read (missing, corrupt, or otherwise invalid).
+    """
+    try:
+        with open(cache_path_for_station(station), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except OSError, ValueError:
+        return None
+
+
+def save_cached_tracks(station, tracks):
+    """Save a station's track list to disk, best-effort.
+
+    Failures are silent: the cache is a convenience (it saves a slow,
+    sometimes-flaky yt-dlp fetch on the next visit), not something
+    playback should ever depend on.
+
+    Parameters
+    ----------
+    station : dict
+        Station dict with a ``url`` key.
+    tracks : list of dict
+        Tracks as returned by `fetch_tracks`, to persist verbatim.
+    """
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(cache_path_for_station(station), "w", encoding="utf-8") as f:
+            json.dump(tracks, f)
+    except OSError:
+        pass
+
+
+def fetch_and_cache_tracks(station, limit):
+    """Fetch a station's tracks over the network, tag them, and cache them.
+
+    Parameters
+    ----------
+    station : dict
+        Station dict with ``url`` and ``label`` keys.
+    limit : int
+        Max number of tracks to fetch, passed through to `fetch_tracks`.
+
+    Returns
+    -------
+    list of dict
+        The fetched tracks, each tagged with ``channel`` set to the
+        station's label.
+
+    Raises
+    ------
+    subprocess.CalledProcessError
+        If yt-dlp fails (network error, invalid channel, etc.).
+    """
+    tracks = fetch_tracks(station["url"], limit)
+    for track in tracks:
+        track["channel"] = station["label"]
+    save_cached_tracks(station, tracks)
+    return tracks
+
+
 def resolve_stream_url(track_url):
     """Resolve a SoundCloud track page URL to a direct audio stream URL.
 
@@ -393,7 +484,7 @@ def prepare_track(track, attempts=3):
     raise last_error
 
 
-class Player:
+class Player:  # pylint: disable=too-many-instance-attributes
     """Manage a background ``ffplay`` process and track its playback position.
 
     Attributes
@@ -581,7 +672,7 @@ def _braille_char(left_n, right_n, grow_from_top):
     return chr(0x2800 + bits) if bits else " "
 
 
-def rms_graph_rows(history, half_rows, width):
+def rms_graph_rows(history, half_rows, width):  # pylint: disable=too-many-locals
     """Render a scrolling, vertically mirrored bar graph of RMS volume.
 
     The upper half shows the peak level growing upward from a center
@@ -829,7 +920,7 @@ def draw_panel_border(stdscr, y, x, height, width):
     stdscr.addnstr(y + height - 1, x, BOX_BL + BOX_H * (width - 2) + BOX_BR, width)
 
 
-def draw_stations(stdscr, stations, selected, top, status):
+def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=too-many-locals
     """Render the station-list screen: a bordered pane with a header and a
     scrollable list, in the same style as the now-playing panel.
 
@@ -904,8 +995,16 @@ def draw_stations(stdscr, stations, selected, top, status):
     return top
 
 
-def draw_tracks(stdscr, tracks, selected, top, status):
-    """Render the track-list screen for a SoundCloud channel.
+def draw_tracks(stdscr, tracks, selected, top, status):  # pylint: disable=too-many-locals
+    """Render the track-list screen for a SoundCloud channel: a bordered
+    pane with a header and a scrollable list, in the same style as the
+    now-playing panel.
+
+    The pane shrinks to fit and centers vertically when the track list is
+    short, or grows to fill the available height (scrolling) when it
+    isn't — the same sizing behavior as the stations screen. The
+    brand/version stays top-right of row 0, above the pane, and the
+    status/hint bar stays on the last row, below it.
 
     Parameters
     ----------
@@ -929,32 +1028,48 @@ def draw_tracks(stdscr, tracks, selected, top, status):
     """
     stdscr.erase()
     height, width = stdscr.getmaxyx()
-    list_height = height - 3
 
+    panel_width = min(max(width - 4, 20), max(width - 2, 1))
+    content_width = max(panel_width - 4, 1)
+    panel_x = max((width - panel_width) // 2, 0)
+    desired_height = 2 + 1 + len(tracks)
+    if height >= 4:
+        # Row 0 (brand) and the last row (status bar) are always kept free.
+        usable_height = max(height - 2, 1)
+        panel_height = min(desired_height, usable_height)
+        panel_y = 1 + max((usable_height - panel_height) // 2, 0)
+    else:
+        panel_y = 0
+        panel_height = max(height - 1, 1)
+
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_top_right(stdscr, 0, width, APP_BRAND)
+
+    list_height = max(panel_height - 3, 0)
     if selected < top:
         top = selected
     elif selected >= top + list_height:
         top = selected - list_height + 1
 
-    header = format_row("DATE", "LENGTH", "ARTIST", "TITLE", width)
-    stdscr.addnstr(0, 0, header[: width - 1], width - 1, curses.A_UNDERLINE)
-    draw_top_right(stdscr, 0, width, APP_BRAND, len(header))
+    header = format_row("DATE", "LENGTH", "ARTIST", "TITLE", content_width).ljust(content_width)
+    if panel_y + 1 < height:
+        stdscr.addnstr(panel_y + 1, panel_x + 2, header[:content_width], content_width, curses.A_UNDERLINE)
 
     for row in range(list_height):
         idx = top + row
         if idx >= len(tracks):
             break
         track = tracks[idx]
-        line = format_row(track["date"], track["duration"], track["artist"], track["title"], width)
+        line = format_row(track["date"], track["duration"], track["artist"], track["title"], content_width)
         attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
-        stdscr.addnstr(row + 1, 0, line[: width - 1], width - 1, attr)
+        stdscr.addnstr(panel_y + 2 + row, panel_x + 2, line[:content_width], content_width, attr)
 
     draw_status_bar(stdscr, height - 1, width, status)
     stdscr.refresh()
     return top
 
 
-def draw_playing(stdscr, item, player, status):
+def draw_playing(stdscr, item, player, status):  # pylint: disable=too-many-locals,too-many-statements
     """Render the now-playing screen: a centered panel with an RMS volume graph.
 
     Shows title, artist/date, and source channel in a bordered panel,
@@ -1061,7 +1176,7 @@ def track_hint(count, continuous):
         The formatted hint line.
     """
     state = "ON" if continuous else "OFF"
-    return f"{count} tracks | j/k move, gg/G top/bottom, Enter play, c continuous:{state}, b back, q quit"
+    return f"{count} tracks | j/k move, gg/G top/bottom, Enter play, c continuous:{state}, r refresh, b back, q quit"
 
 
 def playing_hint(continuous, back_view):
@@ -1105,6 +1220,9 @@ class AppState:  # pylint: disable=too-many-instance-attributes
         Status/hint text for the stations screen.
     tracks : list of dict
         Tracks fetched for the currently browsed SoundCloud station.
+    current_station : dict or None
+        The SoundCloud station `tracks` belongs to, so ``r`` can re-fetch
+        and re-cache the right one from the tracks screen.
     track_selected : int
         Index of the highlighted track in the tracks screen.
     track_top : int
@@ -1132,6 +1250,7 @@ class AppState:  # pylint: disable=too-many-instance-attributes
     station_status: str = ""
 
     tracks: list = field(default_factory=list)
+    current_station: dict | None = None
     track_selected: int = 0
     track_top: int = 0
     track_status: str = ""
@@ -1150,11 +1269,14 @@ class AppState:  # pylint: disable=too-many-instance-attributes
 
 
 def select_station(stdscr, state, player, limit):
-    """Handle Enter on the stations screen: fetch tracks or play live radio.
+    """Handle Enter on the stations screen: load tracks or play live radio.
 
-    If the selected station is a SoundCloud URL, fetches its tracks and
-    switches `state.view` to ``"tracks"``. Otherwise, starts playing the
-    station directly as a live stream and switches to ``"playing"``.
+    If the selected station is a SoundCloud URL, loads its tracks from the
+    on-disk cache when one exists — yt-dlp fetches are slow and sometimes
+    fail outright, so normal navigation never re-fetches over the network.
+    Only a first-ever visit (no cache yet) fetches fresh; press ``r`` on
+    the tracks screen to force a refresh later. Otherwise, starts playing
+    the station directly as a live stream and switches to ``"playing"``.
 
     Parameters
     ----------
@@ -1169,12 +1291,20 @@ def select_station(stdscr, state, player, limit):
     """
     station = state.stations[state.station_selected]
     if is_soundcloud_url(station["url"]):
+        cached = load_cached_tracks(station)
+        if cached is not None:
+            state.tracks = cached
+            state.current_station = station
+            state.track_selected = 0
+            state.track_top = 0
+            state.track_status = track_hint(len(state.tracks), state.continuous)
+            state.view = "tracks"
+            return
         state.station_status = f"Fetching tracks: {station['label']}..."
         draw_stations(stdscr, state.stations, state.station_selected, state.station_top, state.station_status)
         try:
-            state.tracks = fetch_tracks(station["url"], limit)
-            for track in state.tracks:
-                track["channel"] = station["label"]
+            state.tracks = fetch_and_cache_tracks(station, limit)
+            state.current_station = station
             state.track_selected = 0
             state.track_top = 0
             state.track_status = track_hint(len(state.tracks), state.continuous)
@@ -1278,7 +1408,37 @@ def play_track(stdscr, state, player, track):
         state.track_status = f"Failed to download: {track['title']}"
 
 
-def handle_tracks_view(stdscr, state, player):
+def refresh_tracks(stdscr, state, limit):
+    """Handle ``r`` on the tracks screen: force a fresh fetch and re-cache.
+
+    Unlike `select_station`, this always hits the network — it's the only
+    way to pick up new uploads or recover from a stale/corrupt cache.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into while fetching (shows a status message).
+    state : AppState
+        Mutable app state; updated in place. Uses `state.current_station`
+        set by `select_station`; does nothing if that's unset.
+    limit : int
+        Max number of tracks to fetch, passed through to `fetch_tracks`.
+    """
+    station = state.current_station
+    if station is None:
+        return
+    state.track_status = f"Refreshing tracks: {station['label']}..."
+    draw_tracks(stdscr, state.tracks, state.track_selected, state.track_top, state.track_status)
+    try:
+        state.tracks = fetch_and_cache_tracks(station, limit)
+        state.track_selected = 0
+        state.track_top = 0
+        state.track_status = track_hint(len(state.tracks), state.continuous)
+    except subprocess.CalledProcessError as exc:
+        state.track_status = f"Failed to refresh tracks: {exc.stderr}"
+
+
+def handle_tracks_view(stdscr, state, player, limit):
     """Draw the tracks screen and handle one keypress on it.
 
     Parameters
@@ -1289,6 +1449,8 @@ def handle_tracks_view(stdscr, state, player):
         Mutable app state; updated in place based on the key pressed.
     player : Player
         The active player, used for the ``v``/``x`` keys.
+    limit : int
+        Max number of tracks to fetch, passed through to `refresh_tracks`.
 
     Returns
     -------
@@ -1319,6 +1481,9 @@ def handle_tracks_view(stdscr, state, player):
         state.pending_g = False
         state.continuous = not state.continuous
         state.track_status = track_hint(len(state.tracks), state.continuous)
+    elif key == ord("r"):
+        state.pending_g = False
+        refresh_tracks(stdscr, state, limit)
     elif key == ord("v") and player.is_playing():
         state.pending_g = False
         state.playing_status = playing_hint(state.continuous, state.back_view)
@@ -1430,7 +1595,8 @@ def run_view(stdscr, state, player, limit):
     player : Player
         The active player, passed through to the handler.
     limit : int
-        Max tracks to fetch, passed through to `handle_stations_view`.
+        Max tracks to fetch, passed through to `handle_stations_view` and
+        `handle_tracks_view`.
 
     Returns
     -------
@@ -1440,7 +1606,7 @@ def run_view(stdscr, state, player, limit):
     if state.view == "stations":
         return handle_stations_view(stdscr, state, player, limit)
     if state.view == "tracks":
-        return handle_tracks_view(stdscr, state, player)
+        return handle_tracks_view(stdscr, state, player, limit)
     return handle_playing_view(stdscr, state, player)
 
 

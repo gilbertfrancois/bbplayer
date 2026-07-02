@@ -41,6 +41,7 @@ import threading
 import time
 import tomllib
 import urllib.request
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -74,14 +75,41 @@ UNICODE_OK = supports_unicode()
 BAR_FILLED = "⣿" if UNICODE_OK else "#"
 BAR_EMPTY = "⠒" if UNICODE_OK else "-"
 
-STATUS_LINE_RE = re.compile(r"^\s*(\d+\.\d+)\s+\S*-\S*:")
+BOX_H = "─" if UNICODE_OK else "-"
+BOX_V = "│" if UNICODE_OK else "|"
+BOX_TL = "╭" if UNICODE_OK else "+"
+BOX_TR = "╮" if UNICODE_OK else "+"
+BOX_BL = "╰" if UNICODE_OK else "+"
+BOX_BR = "╯" if UNICODE_OK else "+"
 
-TAPE_PATTERN = BAR_FILLED * 2 + BAR_EMPTY * 6
-TAPE_STEP_SECONDS = 0.5
+GRAPH_HALF_ROWS = 6
+GRAPH_ROWS = GRAPH_HALF_ROWS * 2
+
+STATUS_LINE_RE = re.compile(r"^\s*(\d+\.\d+)\s+\S*-\S*:")
+RMS_LEVEL_RE = re.compile(r"lavfi\.astats\.Overall\.RMS_level=(-?[\d.]+|-inf|nan)")
+
+# Per-column Braille dot bitmasks (index = 0..4 dots lit), for the left and
+# right dot-columns of one character cell independently. This lets each
+# character encode two distinct samples (one per dot-column) rather than
+# lighting both together, doubling the graph's horizontal resolution.
+# *_BOTTOM fills from the bottom of the cell upward (upper graph half,
+# which grows away from the center line, i.e. upward); *_TOP fills from
+# the top downward (lower half, which grows away from center downward).
+LEFT_DOTS_BOTTOM = (0x00, 0x40, 0x44, 0x46, 0x47)
+RIGHT_DOTS_BOTTOM = (0x00, 0x80, 0xA0, 0xB0, 0xB8)
+LEFT_DOTS_TOP = (0x00, 0x01, 0x03, 0x07, 0x47)
+RIGHT_DOTS_TOP = (0x00, 0x08, 0x18, 0x38, 0xB8)
+RMS_HISTORY_LEN = 300
+RMS_WINDOW_SECONDS = 0.2
+RMS_FLOOR_DB = -40.0
+RMS_CEIL_DB = 0.0
+RMS_MAX_SCALE = 1.0
+RMS_MIN_SCALE = 0.6
 
 LABEL_COL = 16
 DATE_COL = 10
 DURATION_COL = 8
+ARTIST_COL = 20
 
 STATIONS_EXAMPLE = """Example stations.toml:
 
@@ -190,6 +218,25 @@ def format_duration(seconds):
     return f"{minutes}:{seconds:02d}"
 
 
+def parse_rms_db(text):
+    """Convert an astats ``RMS_level`` string to a floor-clamped dB value.
+
+    Parameters
+    ----------
+    text : str
+        The raw value matched by `RMS_LEVEL_RE`: a decimal string, or
+        ``"-inf"``/``"nan"`` during silence.
+
+    Returns
+    -------
+    float
+        The level in dBFS, clamped to `RMS_FLOOR_DB` at the low end.
+    """
+    if text in ("-inf", "nan"):
+        return RMS_FLOOR_DB
+    return max(float(text), RMS_FLOOR_DB)
+
+
 def fetch_tracks(channel_url, limit):
     """Fetch metadata for the most recent tracks on a SoundCloud channel.
 
@@ -205,9 +252,9 @@ def fetch_tracks(channel_url, limit):
     Returns
     -------
     list of dict
-        Track dicts with ``title``, ``url``, ``timestamp``, ``date``,
-        ``duration`` (formatted string), and ``duration_secs`` (raw
-        seconds, or None if unknown), sorted newest first.
+        Track dicts with ``title``, ``artist``, ``url``, ``timestamp``,
+        ``date``, ``duration`` (formatted string), and ``duration_secs``
+        (raw seconds, or None if unknown), sorted newest first.
 
     Raises
     ------
@@ -228,6 +275,7 @@ def fetch_tracks(channel_url, limit):
         tracks.append(
             {
                 "title": data.get("title") or "(untitled)",
+                "artist": data.get("artist") or data.get("uploader") or "(unknown artist)",
                 "url": data["webpage_url"],
                 "timestamp": data.get("timestamp") or 0,
                 "date": format_date(data.get("upload_date")),
@@ -357,6 +405,10 @@ class Player:
     elapsed : float
         Seconds into the current stream, parsed live from ffplay's stderr
         status line.
+    rms_history : collections.deque of (float, float)
+        Recent ``(min_db, peak_db)`` RMS volume readings (oldest first),
+        each aggregated over `RMS_WINDOW_SECONDS` of ffplay's
+        `astats`/`ametadata` audio filter output.
     temp_path : str or None
         Path to a downloaded temp file to delete on `stop`, if any.
     """
@@ -366,6 +418,9 @@ class Player:
         self.proc = None
         self.title = None
         self.elapsed = 0.0
+        self.rms_history = deque(maxlen=RMS_HISTORY_LEN)
+        self._rms_window = []
+        self._rms_window_start = None
         self._reader_thread = None
         self.temp_path = None
 
@@ -386,10 +441,19 @@ class Player:
         self.stop()
         # No -loglevel quiet: ffplay's stderr status line ("12.34 M-A: ...")
         # is how we read live playback position without a real IPC channel.
+        # The astats/ametadata filter chain likewise prints an RMS volume
+        # reading to stderr for every audio frame, for the volume graph.
         # Process outlives this method (managed via stop()/is_playing()), so
         # a `with` block here would kill it as soon as play() returns.
         self.proc = subprocess.Popen(  # pylint: disable=consider-using-with
-            ["ffplay", "-nodisp", "-autoexit", stream_url],
+            [
+                "ffplay",
+                "-nodisp",
+                "-autoexit",
+                "-af",
+                "astats=metadata=1:reset=1,ametadata=print:key=lavfi.astats.Overall.RMS_level",
+                stream_url,
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -397,25 +461,53 @@ class Player:
         )
         self.title = title
         self.elapsed = 0.0
+        self.rms_history.clear()
+        self._rms_window = []
+        self._rms_window_start = None
         self.temp_path = temp_path
         self._reader_thread = threading.Thread(target=self._read_progress, daemon=True)
         self._reader_thread.start()
 
     def _read_progress(self):
-        """Continuously parse ffplay's stderr for its playback position.
+        """Continuously parse ffplay's stderr for playback position and volume.
 
         Runs in a background thread started by `play`; updates
-        `self.elapsed` as each new status line arrives. Returns when
+        `self.elapsed` on every status line, and collects RMS readings into
+        `self._rms_window`, flushing a ``(min_db, peak_db)`` pair to
+        `self.rms_history` every `RMS_WINDOW_SECONDS`. Returns when
         ffplay's stderr closes (process exited).
         """
         proc = self.proc
         try:
             for line in proc.stderr:
-                match = STATUS_LINE_RE.match(line)
-                if match:
-                    self.elapsed = float(match.group(1))
+                status_match = STATUS_LINE_RE.match(line)
+                if status_match:
+                    self.elapsed = float(status_match.group(1))
+                    continue
+                rms_match = RMS_LEVEL_RE.search(line)
+                if rms_match:
+                    self._collect_rms(parse_rms_db(rms_match.group(1)))
         except ValueError, OSError:
             pass
+
+    def _collect_rms(self, db):
+        """Add one RMS reading to the current window, flushing it if due.
+
+        Parameters
+        ----------
+        db : float
+            A single RMS reading in dBFS, already floor-clamped.
+        """
+        now = time.time()
+        if self._rms_window_start is None:
+            self._rms_window_start = now
+        self._rms_window.append(db)
+        if now - self._rms_window_start >= RMS_WINDOW_SECONDS:
+            minimum = min(self._rms_window)
+            peak = max(self._rms_window)
+            self.rms_history.append((minimum, peak))
+            self._rms_window = []
+            self._rms_window_start = now
 
     def stop(self):
         """Terminate any running ffplay process and clean up its temp file."""
@@ -424,6 +516,9 @@ class Player:
         self.proc = None
         self.title = None
         self.elapsed = 0.0
+        self.rms_history.clear()
+        self._rms_window = []
+        self._rms_window_start = None
         if self.temp_path:
             try:
                 os.remove(self.temp_path)
@@ -442,34 +537,191 @@ class Player:
         return self.proc is not None and self.proc.poll() is None
 
 
-def tape_scroll(width):
-    """Render one animation frame of a "tape deck" scrolling bar.
-
-    The `TAPE_PATTERN` repeats across `width` columns and shifts one
-    character to the right every `TAPE_STEP_SECONDS`, looping forever, based
-    on the wall clock (so redraw timing doesn't affect the animation speed).
+def _db_to_dots(db, max_dots):
+    """Normalize a dB level to a 0..`max_dots` fill amount.
 
     Parameters
     ----------
-    width : int
-        Number of characters to render.
+    db : float
+        Level in dBFS.
+    max_dots : int
+        Number of sub-row dots available (one half's row count times the
+        Braille sub-row resolution, or 1 per row without Braille support).
+
+    Returns
+    -------
+    int
+        Fill amount, clamped to ``[0, max_dots]``.
+    """
+    value = (db - RMS_FLOOR_DB) / (RMS_CEIL_DB - RMS_FLOOR_DB)
+    return max(0, min(round(value * max_dots), max_dots))
+
+
+def _braille_char(left_n, right_n, grow_from_top):
+    """Combine independent left/right dot-column fill levels into one glyph.
+
+    Parameters
+    ----------
+    left_n, right_n : int
+        Number of dots lit in each column, 0..4.
+    grow_from_top : bool
+        False to fill from the bottom of the cell upward (the graph's
+        upper half, which grows away from the center line, i.e. upward);
+        True to fill from the top downward (the lower half, which grows
+        away from center downward).
 
     Returns
     -------
     str
-        A string of exactly `width` characters (empty if `width` <= 0).
+        A single Braille character, or a blank space if both are 0.
     """
-    if width <= 0:
-        return ""
-    period = len(TAPE_PATTERN)
-    step = int(time.time() / TAPE_STEP_SECONDS) % period
-    repeated = TAPE_PATTERN * (width // period + 2)
-    start = (period - step) % period
-    return repeated[start : start + width]
+    left_bits = LEFT_DOTS_TOP if grow_from_top else LEFT_DOTS_BOTTOM
+    right_bits = RIGHT_DOTS_TOP if grow_from_top else RIGHT_DOTS_BOTTOM
+    bits = left_bits[left_n] | right_bits[right_n]
+    return chr(0x2800 + bits) if bits else " "
 
 
-def format_row(col1, col2, title, width):
-    """Format a fixed-width ``DATE  LENGTH  TITLE``-style table row.
+def rms_graph_rows(history, half_rows, width):
+    """Render a scrolling, vertically mirrored bar graph of RMS volume.
+
+    The upper half shows the peak level growing upward from a center
+    line, rendered normal-brightness; the lower half shows the minimum
+    level growing downward, rendered dim — an asymmetric mirror, rather
+    than combining both values into each half. Using a flat attribute per
+    half (rather than a gradient by row) keeps the two halves visually
+    distinct right up to the center line, instead of both fading to the
+    same shade and blurring into a gray band there. When Braille is
+    available, each character's left and right dot-columns are driven by
+    two independent, consecutive history samples (oldest on the left),
+    doubling horizontal resolution so a single loud sample shows as a
+    1-dot-wide spike rather than 2 dots wide.
+
+    Parameters
+    ----------
+    history : sequence of (float, float)
+        Recent ``(min_db, peak_db)`` windows (oldest first, most recent
+        last), as collected by `Player._read_progress`.
+    half_rows : int
+        Number of terminal rows per half (the graph is `2 * half_rows`
+        rows tall in total).
+    width : int
+        Number of columns to display.
+
+    Returns
+    -------
+    list of list of (str, int)
+        `2 * half_rows` rows, each a list of `width` ``(char, attr)``
+        cells.
+    """
+    total_rows = half_rows * 2
+    rows = [[(" ", curses.A_DIM) for _ in range(width)] for _ in range(total_rows)]
+    if width <= 0 or half_rows <= 0:
+        return rows
+
+    sub_levels = 4 if UNICODE_OK else 1
+    max_dots = half_rows * sub_levels
+    samples_per_col = 2 if UNICODE_OK else 1
+
+    needed = width * samples_per_col
+    samples = list(history)[-needed:]
+    samples = [(RMS_FLOOR_DB, RMS_FLOOR_DB)] * (needed - len(samples)) + samples
+
+    for col in range(width):
+        left_min_db, left_peak_db = samples[col * samples_per_col]
+        right_min_db, right_peak_db = samples[col * samples_per_col + samples_per_col - 1]
+
+        left_peak_dots = round(_db_to_dots(left_peak_db, max_dots) * RMS_MAX_SCALE)
+        right_peak_dots = round(_db_to_dots(right_peak_db, max_dots) * RMS_MAX_SCALE)
+        left_min_dots = round(_db_to_dots(left_min_db, max_dots) * RMS_MIN_SCALE)
+        right_min_dots = round(_db_to_dots(right_min_db, max_dots) * RMS_MIN_SCALE)
+
+        for half_row in range(half_rows):
+            dist = half_rows - 1 - half_row
+
+            peak_left_n = max(0, min(left_peak_dots - dist * sub_levels, sub_levels))
+            peak_right_n = max(0, min(right_peak_dots - dist * sub_levels, sub_levels))
+            if peak_left_n or peak_right_n:
+                char = _braille_char(peak_left_n, peak_right_n, grow_from_top=False) if UNICODE_OK else "#"
+                rows[half_row][col] = (char, curses.A_NORMAL)
+
+            min_left_n = max(0, min(left_min_dots - dist * sub_levels, sub_levels))
+            min_right_n = max(0, min(right_min_dots - dist * sub_levels, sub_levels))
+            if min_left_n or min_right_n:
+                char = _braille_char(min_left_n, min_right_n, grow_from_top=True) if UNICODE_OK else "#"
+                rows[total_rows - 1 - half_row][col] = (char, curses.A_DIM)
+
+    return rows
+
+
+def draw_bar_segment(stdscr, y, x, bar_str, screen_width):
+    """Draw a bar string, dimming background cells and brightening active ones.
+
+    `bar_str` is drawn in runs of consecutive identical characters so that
+    active cells (anything but ``BAR_EMPTY`` or blank space) render brighter
+    (bold) than background cells (dim), without relying on terminal color
+    support. Clipped to `screen_width` so an oversized bar can't write past
+    the edge of the terminal.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    y, x : int
+        Starting row/column for the bar.
+    bar_str : str
+        The bar contents (e.g. as produced by a progress fill).
+    screen_width : int
+        Total terminal width; `bar_str` is truncated so it never extends
+        past column ``screen_width - 1``.
+    """
+    bar_str = bar_str[: max(screen_width - x, 0)]
+    col = x
+    i = 0
+    while i < len(bar_str):
+        j = i
+        while j < len(bar_str) and bar_str[j] == bar_str[i]:
+            j += 1
+        attr = curses.A_DIM if bar_str[i] in (BAR_EMPTY, " ") else curses.A_BOLD
+        stdscr.addnstr(y, col, bar_str[i:j], j - i, attr)
+        col += j - i
+        i = j
+
+
+def draw_graph_row(stdscr, y, x, cells, screen_width):
+    """Draw one row of `(char, attr)` cells, as produced by `rms_graph_rows`.
+
+    Consecutive cells with an identical `(char, attr)` pair are drawn in a
+    single run for efficiency. Clipped to `screen_width` so an oversized
+    row can't write past the edge of the terminal.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    y, x : int
+        Starting row/column for the row.
+    cells : list of (str, int)
+        One `(character, curses attribute)` pair per column.
+    screen_width : int
+        Total terminal width; `cells` is truncated so it never extends
+        past column ``screen_width - 1``.
+    """
+    cells = cells[: max(screen_width - x, 0)]
+    col = x
+    i = 0
+    while i < len(cells):
+        j = i
+        while j < len(cells) and cells[j] == cells[i]:
+            j += 1
+        char, attr = cells[i]
+        run_len = j - i
+        stdscr.addnstr(y, col, char * run_len, run_len, attr)
+        col += run_len
+        i = j
+
+
+def format_row(col1, col2, col3, title, width):
+    """Format a fixed-width ``DATE  LENGTH  ARTIST  TITLE``-style table row.
 
     Parameters
     ----------
@@ -477,6 +729,8 @@ def format_row(col1, col2, title, width):
         Text for the first (date-width) column.
     col2 : str
         Text for the second (duration-width) column.
+    col3 : str
+        Text for the third (artist-width) column; truncated to fit.
     title : str
         Text for the remaining space; truncated to fit `width`.
     width : int
@@ -487,8 +741,8 @@ def format_row(col1, col2, title, width):
     str
         The formatted row.
     """
-    title_width = max(width - DATE_COL - DURATION_COL - 2, 0)
-    return f"{col1:<{DATE_COL}} {col2:<{DURATION_COL}} {title[:title_width]}"
+    title_width = max(width - DATE_COL - DURATION_COL - ARTIST_COL - 3, 0)
+    return f"{col1:<{DATE_COL}} {col2:<{DURATION_COL}} " f"{col3[:ARTIST_COL]:<{ARTIST_COL}} {title[:title_width]}"
 
 
 def draw_status_bar(stdscr, y, width, status):
@@ -533,6 +787,46 @@ def draw_top_right(stdscr, y, width, text, existing_len=0):
     x = avail - len(text)
     if x > existing_len:
         stdscr.addnstr(y, x, text, avail - x, curses.A_DIM)
+
+
+def center_text(text, width):
+    """Pad `text` with spaces on both sides to center it within `width`.
+
+    Parameters
+    ----------
+    text : str
+        Text to center; truncated if longer than `width`.
+    width : int
+        Field width to center within.
+
+    Returns
+    -------
+    str
+        The centered, space-padded string, exactly `width` characters long.
+    """
+    text = text[:width]
+    pad = width - len(text)
+    left = pad // 2
+    return " " * left + text + " " * (pad - left)
+
+
+def draw_panel_border(stdscr, y, x, height, width):
+    """Draw a rounded-corner box border.
+
+    Parameters
+    ----------
+    stdscr : curses window
+        Window to draw into.
+    y, x : int
+        Top-left corner of the border.
+    height, width : int
+        Outer size of the box, including the border itself.
+    """
+    stdscr.addnstr(y, x, BOX_TL + BOX_H * (width - 2) + BOX_TR, width)
+    for row in range(1, height - 1):
+        stdscr.addnstr(y + row, x, BOX_V, 1)
+        stdscr.addnstr(y + row, x + width - 1, BOX_V, 1)
+    stdscr.addnstr(y + height - 1, x, BOX_BL + BOX_H * (width - 2) + BOX_BR, width)
 
 
 def draw_stations(stdscr, stations, selected, top, status):
@@ -618,7 +912,7 @@ def draw_tracks(stdscr, tracks, selected, top, status):
     elif selected >= top + list_height:
         top = selected - list_height + 1
 
-    header = format_row("DATE", "LENGTH", "TITLE", width)
+    header = format_row("DATE", "LENGTH", "ARTIST", "TITLE", width)
     stdscr.addnstr(0, 0, header[: width - 1], width - 1, curses.A_UNDERLINE)
     draw_top_right(stdscr, 0, width, APP_BRAND, len(header))
 
@@ -627,7 +921,7 @@ def draw_tracks(stdscr, tracks, selected, top, status):
         if idx >= len(tracks):
             break
         track = tracks[idx]
-        line = format_row(track["date"], track["duration"], track["title"], width)
+        line = format_row(track["date"], track["duration"], track["artist"], track["title"], width)
         attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
         stdscr.addnstr(row + 1, 0, line[: width - 1], width - 1, attr)
 
@@ -637,49 +931,91 @@ def draw_tracks(stdscr, tracks, selected, top, status):
 
 
 def draw_playing(stdscr, item, player, status):
-    """Render the now-playing screen: title, date, and a timeline/tape bar.
+    """Render the now-playing screen: a centered panel with an RMS volume graph.
 
-    Shows a filled progress bar with elapsed/total time for items with a
-    known duration (SoundCloud tracks), or a looping "tape deck" scroll
-    animation with just an elapsed timer for live/infinite streams (radio).
+    Shows title, artist/date, and source channel in a bordered panel,
+    vertically centered in the terminal, above a scrolling RMS volume
+    history graph (from `Player.rms_history`; peak growing up from a
+    center line in normal brightness, minimum growing down in dim) and a
+    single-line info row: a filled progress bar with elapsed/total time
+    for items with a known duration (SoundCloud tracks), or just an
+    elapsed timer and a "LIVE" marker for live/infinite streams (radio).
 
     Parameters
     ----------
     stdscr : curses window
         Window to draw into.
     item : dict
-        The now-playing item; needs ``title``, and optionally ``date``,
-        ``duration`` (formatted string), and ``duration_secs`` (raw
-        seconds, or falsy/absent for live streams).
+        The now-playing item; needs ``title``, and optionally ``artist``,
+        ``date``, ``channel``, ``duration`` (formatted string), and
+        ``duration_secs`` (raw seconds, or falsy/absent for live streams).
     player : Player
-        The active player, used to read `Player.elapsed`.
+        The active player, used to read `Player.elapsed` and
+        `Player.rms_history`.
     status : str
         Status/hint text for the bottom bar.
     """
     stdscr.erase()
     height, width = stdscr.getmaxyx()
 
-    title = item["title"]
-    stdscr.addnstr(0, 0, title[: width - 1], width - 1, curses.A_BOLD)
-    draw_top_right(stdscr, 0, width, APP_BRAND, len(title))
-    stdscr.addnstr(1, 0, item.get("date", "")[: width - 1], width - 1)
+    artist = item.get("artist", "")
+    date = item.get("date", "")
+    channel = item.get("channel", "")
+    subtitle = f"{artist}  ·  {date}" if artist else date
+
+    body_lines = [(item["title"], curses.A_BOLD)]
+    if subtitle:
+        body_lines.append((subtitle, curses.A_NORMAL))
+    if channel:
+        body_lines.append((f"— {channel} —", curses.A_DIM))
+
+    panel_width = min(max(width - 4, 20), max(width - 2, 1))
+    content_width = max(panel_width - 4, 1)
+    panel_height = min(2 + len(body_lines) + 1 + GRAPH_ROWS + 1, max(height - 1, 3))
+
+    panel_x = max((width - panel_width) // 2, 0)
+    panel_y = max((height - 1 - panel_height) // 2, 0)
+
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_top_right(stdscr, 0, width, APP_BRAND)
+
+    row = panel_y + 1
+    last_row = panel_y + panel_height - 1
+    for text, attr in body_lines:
+        if row >= last_row:
+            break
+        stdscr.addnstr(row, panel_x + 2, center_text(text, content_width), content_width, attr)
+        row += 1
+    row += 1  # blank separator before the volume graph
+
+    for graph_row in rms_graph_rows(player.rms_history, GRAPH_HALF_ROWS, content_width):
+        if row >= last_row:
+            break
+        draw_graph_row(stdscr, row, panel_x + 2, graph_row, width)
+        row += 1
 
     elapsed_str = format_duration(player.elapsed)
     duration_secs = item.get("duration_secs")
-    avail = max(width - 1, 1)
 
     if duration_secs:
-        total_str = item["duration"]
-        bar_width = max(avail - len(elapsed_str) - len(total_str) - 4, 1)
+        suffix = item["duration"]
+        bar_width = max(content_width - len(elapsed_str) - len(suffix) - 2, 1)
         filled = int(min(player.elapsed / duration_secs, 1.0) * bar_width)
-        bar_str = BAR_FILLED * filled + BAR_EMPTY * (bar_width - filled)
-        timeline = f"{elapsed_str} [{bar_str}] {total_str}"
+        progress_str = BAR_FILLED * filled + BAR_EMPTY * (bar_width - filled)
     else:
-        bar_width = max(avail - len(elapsed_str) - 6, 1)
-        bar_str = tape_scroll(bar_width)
-        timeline = f"{elapsed_str} [{bar_str}] LIVE"
+        suffix = "LIVE"
+        bar_width = max(content_width - len(elapsed_str) - 6, 1)
+        progress_str = " " * bar_width
 
-    stdscr.addnstr(3, 0, timeline[:avail], avail)
+    bar_x = panel_x + 2 + len(elapsed_str) + 1
+    suffix_x = bar_x + bar_width + 1
+
+    if row < last_row:
+        draw_bar_segment(stdscr, row, bar_x, progress_str, width)
+        if panel_x + 2 < width:
+            stdscr.addnstr(row, panel_x + 2, elapsed_str, max(min(len(elapsed_str), width - (panel_x + 2)), 0))
+        if suffix_x < width:
+            stdscr.addnstr(row, suffix_x, suffix, max(min(len(suffix), width - suffix_x), 0))
 
     draw_status_bar(stdscr, height - 1, width, status)
     stdscr.refresh()
@@ -813,6 +1149,8 @@ def select_station(stdscr, state, player, limit):
         draw_stations(stdscr, state.stations, state.station_selected, state.station_top, state.station_status)
         try:
             state.tracks = fetch_tracks(station["url"], limit)
+            for track in state.tracks:
+                track["channel"] = station["label"]
             state.track_selected = 0
             state.track_top = 0
             state.track_status = track_hint(len(state.tracks), state.continuous)

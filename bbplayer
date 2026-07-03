@@ -52,7 +52,7 @@ DEFAULT_CONFIG = CONFIG_DIR / "stations.toml"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "bbplayer"
 
 APP_NAME = "BLiTzBLiT Player"
-APP_VERSION = "v0.2.0"
+APP_VERSION = "v0.3.1"
 APP_BRAND = f"{APP_NAME} {APP_VERSION}"
 
 

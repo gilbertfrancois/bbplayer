@@ -29,7 +29,7 @@ py_version = 311
 
 [tool.pylint.main]
 py-version = "3.11"
-disable = ["too-many-lines", "too-many-instance-attributes", "consider-using-with", "too-many-locals", "too-many-arguments", "too-many-positional-arguments", "too-many-statements"]
+disable = ["too-many-lines", "too-many-instance-attributes", "consider-using-with", "too-many-locals", "too-many-arguments", "too-many-positional-arguments", "too-many-statements", "global-statement"]
 output-format = "colorized"
 
 [tool.pylint.format]

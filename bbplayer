@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# single-file script; length is mostly docstrings
 
 # Copyright 2026 Gilbert Francois Duivesteijn
 #
@@ -46,43 +45,20 @@ from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+APP_NAME = "BLiTzBLiT Player"
+APP_VERSION = "v0.4.0"
+APP_BRAND = f"{APP_NAME} {APP_VERSION}"
+
 BUNDLED_CONFIG = Path(__file__).resolve().parent / "stations.toml"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "bbplayer"
 DEFAULT_CONFIG = CONFIG_DIR / "stations.toml"
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "bbplayer"
 
-APP_NAME = "BLiTzBLiT Player"
-APP_VERSION = "v0.3.2"
-APP_BRAND = f"{APP_NAME} {APP_VERSION}"
-
-
-def supports_unicode():
-    """Check whether the terminal can reliably render Braille glyphs.
-
-    Returns
-    -------
-    bool
-        True if the locale's preferred encoding is UTF-8 and the terminal
-        is not the raw Linux virtual console (``TERM=linux``), which usually
-        lacks Braille glyphs in its default font even under a UTF-8 locale.
-    """
-    # TERM=linux is the raw Linux virtual console: even under a UTF-8 locale
-    # its default font usually lacks Braille glyphs, so always fall back there.
-    if os.environ.get("TERM") == "linux":
-        return False
-    return locale.getpreferredencoding().lower().startswith("utf")
-
-
-UNICODE_OK = supports_unicode()
-BAR_FILLED = "⣿" if UNICODE_OK else "#"
-BAR_EMPTY = "⠒" if UNICODE_OK else "-"
-
-BOX_H = "─" if UNICODE_OK else "-"
-BOX_V = "│" if UNICODE_OK else "|"
-BOX_TL = "╭" if UNICODE_OK else "+"
-BOX_TR = "╮" if UNICODE_OK else "+"
-BOX_BL = "╰" if UNICODE_OK else "+"
-BOX_BR = "╯" if UNICODE_OK else "+"
+PAIR_DIM = 1
+COLOR_BRIGHT_BLACK = 8  # "bright black": the palette slot every terminal theme defines as gray
+# Fallback for terminals without usable color support; init_colors() (called
+# from main(), once curses is initialized) upgrades this to a real gray.
+DIM_ATTR = curses.A_DIM
 
 GRAPH_HALF_ROWS = 6
 GRAPH_ROWS = GRAPH_HALF_ROWS * 2
@@ -102,7 +78,7 @@ RIGHT_DOTS_BOTTOM = (0x00, 0x80, 0xA0, 0xB0, 0xB8)
 LEFT_DOTS_TOP = (0x00, 0x01, 0x03, 0x07, 0x47)
 RIGHT_DOTS_TOP = (0x00, 0x08, 0x18, 0x38, 0xB8)
 RMS_HISTORY_LEN = 3000
-RMS_WINDOW_SECONDS = 0.2
+RMS_WINDOW_SECONDS = 0.1
 RMS_FLOOR_DB = -40.0
 RMS_CEIL_DB = 0.0
 RMS_MAX_SCALE = 1.0
@@ -123,6 +99,37 @@ url = "https://stream.example.com/radio.mp3"
 label = "My SoundCloud Channel"
 url = "https://soundcloud.com/someartist/tracks"
 """
+
+
+def supports_unicode():
+    """Check whether the terminal can reliably render Braille glyphs.
+
+    Returns
+    -------
+    bool
+        True if the locale's preferred encoding is UTF-8 and the terminal
+        is not the raw Linux virtual console (``TERM=linux``), which usually
+        lacks Braille glyphs in its default font even under a UTF-8 locale.
+    """
+    # TERM=linux is the raw Linux virtual console: even under a UTF-8 locale
+    # its default font usually lacks Braille glyphs, so always fall back there.
+    if os.environ.get("TERM") == "linux":
+        return False
+    return locale.getpreferredencoding().lower().startswith("utf")
+
+
+# These depend on supports_unicode() and so can't be plain top-of-file
+# constants — they're set immediately after its definition instead.
+UNICODE_OK = supports_unicode()
+BAR_FILLED = "⣿" if UNICODE_OK else "#"
+BAR_EMPTY = "⠒" if UNICODE_OK else "-"
+
+BOX_H = "─" if UNICODE_OK else "-"
+BOX_V = "│" if UNICODE_OK else "|"
+BOX_TL = "╭" if UNICODE_OK else "+"
+BOX_TR = "╮" if UNICODE_OK else "+"
+BOX_BL = "╰" if UNICODE_OK else "+"
+BOX_BR = "╯" if UNICODE_OK else "+"
 
 
 class ConfigError(Exception):
@@ -735,7 +742,7 @@ def rms_graph_rows(history, half_rows, width):
         cells.
     """
     total_rows = half_rows * 2
-    rows = [[(" ", curses.A_DIM) for _ in range(width)] for _ in range(total_rows)]
+    rows = [[(" ", DIM_ATTR) for _ in range(width)] for _ in range(total_rows)]
     if width <= 0 or half_rows <= 0:
         return rows
 
@@ -769,7 +776,7 @@ def rms_graph_rows(history, half_rows, width):
             min_right_n = max(0, min(right_min_dots - dist * sub_levels, sub_levels))
             if min_left_n or min_right_n:
                 char = _braille_char(min_left_n, min_right_n, grow_from_top=True) if UNICODE_OK else "#"
-                rows[total_rows - 1 - half_row][col] = (char, curses.A_DIM)
+                rows[total_rows - 1 - half_row][col] = (char, DIM_ATTR)
 
     return rows
 
@@ -802,7 +809,7 @@ def draw_bar_segment(stdscr, y, x, bar_str, screen_width):
         j = i
         while j < len(bar_str) and bar_str[j] == bar_str[i]:
             j += 1
-        attr = curses.A_DIM if bar_str[i] in (BAR_EMPTY, " ") else curses.A_BOLD
+        attr = DIM_ATTR if bar_str[i] in (BAR_EMPTY, " ") else curses.A_BOLD
         stdscr.addnstr(y, col, bar_str[i:j], j - i, attr)
         col += j - i
         i = j
@@ -907,7 +914,7 @@ def draw_top_right(stdscr, y, width, text, existing_len=0):
     avail = max(width - 1, 0)
     x = avail - len(text)
     if x > existing_len:
-        stdscr.addnstr(y, x, text, avail - x, curses.A_DIM)
+        stdscr.addnstr(y, x, text, avail - x, DIM_ATTR)
 
 
 def center_text(text, width):
@@ -1141,7 +1148,7 @@ def draw_playing(stdscr, item, player, status):
     if subtitle:
         body_lines.append((subtitle, curses.A_NORMAL))
     if channel:
-        body_lines.append((f"— {channel} —", curses.A_DIM))
+        body_lines.append((f"— {channel} —", DIM_ATTR))
 
     panel_width = min(max(width - 4, 20), max(width - 2, 1))
     content_width = max(panel_width - 4, 1)
@@ -1645,6 +1652,38 @@ def run_view(stdscr, state, player, limit):
     return handle_playing_view(stdscr, state, player)
 
 
+def init_colors():
+    """Set up a minimal palette that follows the terminal's own colors.
+
+    Normal text is left alone entirely — curses' implicit default pair
+    already renders as whatever the terminal has painted there, and
+    `curses.use_default_colors()` (rather than a fixed black background)
+    is what makes that "whatever" a light or dark terminal theme instead
+    of an app-imposed scheme. The only color explicitly assigned is
+    ``DIM``, drawn using palette index 8 ("bright black") on the default
+    background — every terminal theme, light or dark, defines that slot
+    as a muted gray, distinct from both black and white. (Plain bold
+    black doesn't work for this: most modern 256-color terminals render
+    ``A_BOLD`` as a font-weight change, not a color shift, so it stays
+    literally black.) Falls back to bold black for 8-color-only
+    terminals, or to the plain `curses.A_DIM` attribute if the terminal
+    doesn't support color at all, or doesn't support inheriting its own
+    default colors.
+    """
+    global DIM_ATTR
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        if curses.COLORS >= 16:
+            curses.init_pair(PAIR_DIM, COLOR_BRIGHT_BLACK, -1)
+            DIM_ATTR = curses.color_pair(PAIR_DIM)
+        else:
+            curses.init_pair(PAIR_DIM, curses.COLOR_BLACK, -1)
+            DIM_ATTR = curses.color_pair(PAIR_DIM) | curses.A_BOLD
+    except curses.error:
+        pass
+
+
 def main(stdscr, config_path, limit):
     """Run the app's main event loop.
 
@@ -1665,6 +1704,7 @@ def main(stdscr, config_path, limit):
     ConfigError
         If the config file is missing, empty, or fails to parse.
     """
+    init_colors()
     curses.curs_set(0)
     stdscr.keypad(True)
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# pylint: disable=too-many-lines  # single-file script; length is mostly docstrings
+# single-file script; length is mostly docstrings
 
 # Copyright 2026 Gilbert Francois Duivesteijn
 #
@@ -514,7 +514,7 @@ def prepare_track(track, attempts=3):
     raise last_error
 
 
-class Player:  # pylint: disable=too-many-instance-attributes
+class Player:
     """Manage a background ``ffplay`` process and track its playback position.
 
     Attributes
@@ -566,7 +566,7 @@ class Player:  # pylint: disable=too-many-instance-attributes
         # reading to stderr for every audio frame, for the volume graph.
         # Process outlives this method (managed via stop()/is_playing()), so
         # a `with` block here would kill it as soon as play() returns.
-        self.proc = subprocess.Popen(  # pylint: disable=consider-using-with
+        self.proc = subprocess.Popen(
             [
                 "ffplay",
                 "-nodisp",
@@ -702,7 +702,7 @@ def _braille_char(left_n, right_n, grow_from_top):
     return chr(0x2800 + bits) if bits else " "
 
 
-def rms_graph_rows(history, half_rows, width):  # pylint: disable=too-many-locals
+def rms_graph_rows(history, half_rows, width):
     """Render a scrolling, vertically mirrored bar graph of RMS volume.
 
     The upper half shows the peak level growing upward from a center
@@ -931,9 +931,7 @@ def center_text(text, width):
     return " " * left + text + " " * (pad - left)
 
 
-def draw_panel_border(
-    stdscr, y, x, height, width, title=None
-):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+def draw_panel_border(stdscr, y, x, height, width, title=None):
     """Draw a rounded-corner box border, optionally with an embedded title.
 
     Parameters
@@ -960,7 +958,7 @@ def draw_panel_border(
     stdscr.addnstr(y + height - 1, x, BOX_BL + BOX_H * (width - 2) + BOX_BR, width)
 
 
-def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=too-many-locals
+def draw_stations(stdscr, stations, selected, top, status):
     """Render the station-list screen: a bordered pane titled "Stations"
     with a scrollable list, in the same style as the now-playing panel.
 
@@ -1031,7 +1029,7 @@ def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=t
     return top
 
 
-def draw_tracks(stdscr, tracks, selected, top, status):  # pylint: disable=too-many-locals
+def draw_tracks(stdscr, tracks, selected, top, status):
     """Render the track-list screen for a SoundCloud channel: a bordered
     pane with a header and a scrollable list, in the same style as the
     now-playing panel.
@@ -1106,7 +1104,7 @@ def draw_tracks(stdscr, tracks, selected, top, status):  # pylint: disable=too-m
     return top
 
 
-def draw_playing(stdscr, item, player, status):  # pylint: disable=too-many-locals,too-many-statements
+def draw_playing(stdscr, item, player, status):
     """Render the now-playing screen: a centered panel with an RMS volume graph.
 
     Shows title, artist/date, and source channel in a bordered panel,
@@ -1240,7 +1238,7 @@ def playing_hint(continuous, back_view):
 
 
 @dataclass
-class AppState:  # pylint: disable=too-many-instance-attributes
+class AppState:
     """Shared mutable state for the stations/tracks/playing view loop.
 
     Attributes

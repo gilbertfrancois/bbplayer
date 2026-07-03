@@ -29,9 +29,11 @@ py_version = 311
 
 [tool.pylint.main]
 py-version = "3.11"
-disable = ["raw-checker-failed", "bad-inline-option", "locally-disabled", "file-ignored", "suppressed-message", "useless-suppression", "deprecated-pragma", "use-symbolic-message-instead", "line-too-long", "missing-function-docstring", "missing-class-docstring", "missing-module-docstring"]
-good-names = ["Run", "_", "a", "b", "c", "d", "e", "ex", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"]
+disable = ["too-many-lines", "too-many-instance-attributes", "consider-using-with", "too-many-locals", "too-many-arguments", "too-many-positional-arguments", "too-many-statements"]
 output-format = "colorized"
+
+[tool.pylint.format]
+max-line-length = 120
 
 [tool.pytest.ini_options]
 filterwarnings = [

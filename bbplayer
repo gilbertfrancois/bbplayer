@@ -220,6 +220,36 @@ def format_duration(seconds):
     return f"{minutes}:{seconds:02d}"
 
 
+def format_duration_hms(seconds):
+    """Format a duration in seconds without any leading zero-padding.
+
+    Only as many units as needed are shown, and only the smaller units in
+    a multi-unit result are zero-padded (to stay unambiguous) — the
+    leading unit never is.
+
+    Parameters
+    ----------
+    seconds : float, int, or None
+        Duration in seconds, or None if unknown.
+
+    Returns
+    -------
+    str
+        ``"--"`` if `seconds` is None; otherwise bare seconds (``5``),
+        ``M:SS`` (``1:23``), or ``H:MM:SS`` (``14:04:01``), whichever fits.
+    """
+    if seconds is None:
+        return "--"
+    seconds = int(seconds)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{seconds:02d}"
+    if minutes:
+        return f"{minutes}:{seconds:02d}"
+    return f"{seconds}"
+
+
 def parse_rms_db(text):
     """Convert an astats ``RMS_level`` string to a floor-clamped dB value.
 
@@ -819,7 +849,7 @@ def format_row(col1, col2, col3, title, width):
     col1 : str
         Text for the first (date-width) column.
     col2 : str
-        Text for the second (duration-width) column.
+        Text for the second (duration-width) column; right-aligned.
     col3 : str
         Text for the third (artist-width) column; truncated to fit.
     title : str
@@ -833,7 +863,7 @@ def format_row(col1, col2, col3, title, width):
         The formatted row.
     """
     title_width = max(width - DATE_COL - DURATION_COL - ARTIST_COL - 3, 0)
-    return f"{col1:<{DATE_COL}} {col2:<{DURATION_COL}} " f"{col3[:ARTIST_COL]:<{ARTIST_COL}} {title[:title_width]}"
+    return f"{col1:<{DATE_COL}} {col2:>{DURATION_COL}} " f"{col3[:ARTIST_COL]:<{ARTIST_COL}} {title[:title_width]}"
 
 
 def draw_status_bar(stdscr, y, width, status):

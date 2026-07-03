@@ -931,8 +931,10 @@ def center_text(text, width):
     return " " * left + text + " " * (pad - left)
 
 
-def draw_panel_border(stdscr, y, x, height, width):
-    """Draw a rounded-corner box border.
+def draw_panel_border(
+    stdscr, y, x, height, width, title=None
+):  # pylint: disable=too-many-arguments,too-many-positional-arguments
+    """Draw a rounded-corner box border, optionally with an embedded title.
 
     Parameters
     ----------
@@ -942,8 +944,16 @@ def draw_panel_border(stdscr, y, x, height, width):
         Top-left corner of the border.
     height, width : int
         Outer size of the box, including the border itself.
+    title : str or None, optional
+        If given, embedded into the top border near the left, e.g.
+        ``╭─Stations─────╮``, instead of an unbroken line.
     """
-    stdscr.addnstr(y, x, BOX_TL + BOX_H * (width - 2) + BOX_TR, width)
+    inner_width = max(width - 2, 0)
+    if title:
+        top_inner = (BOX_H + title[: max(inner_width - 1, 0)]).ljust(inner_width, BOX_H)
+    else:
+        top_inner = BOX_H * inner_width
+    stdscr.addnstr(y, x, BOX_TL + top_inner + BOX_TR, width)
     for row in range(1, height - 1):
         stdscr.addnstr(y + row, x, BOX_V, 1)
         stdscr.addnstr(y + row, x + width - 1, BOX_V, 1)
@@ -951,8 +961,8 @@ def draw_panel_border(stdscr, y, x, height, width):
 
 
 def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=too-many-locals
-    """Render the station-list screen: a bordered pane with a header and a
-    scrollable list, in the same style as the now-playing panel.
+    """Render the station-list screen: a bordered pane titled "Stations"
+    with a scrollable list, in the same style as the now-playing panel.
 
     The pane shrinks to fit and centers vertically when the station list
     is short, or grows to fill the available height (scrolling) when it
@@ -987,7 +997,7 @@ def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=t
     panel_width = min(max(width - 4, 20), max(width - 2, 1))
     content_width = max(panel_width - 4, 1)
     panel_x = max((width - panel_width) // 2, 0)
-    desired_height = 2 + 1 + len(stations)
+    desired_height = 2 + len(stations)
     if height >= 4:
         # Row 0 (brand) and the last row (status bar) are always kept free.
         usable_height = max(height - 2, 1)
@@ -997,18 +1007,14 @@ def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=t
         panel_y = 0
         panel_height = max(height - 1, 1)
 
-    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width, title="Stations")
     draw_top_right(stdscr, 0, width, APP_BRAND)
 
-    list_height = max(panel_height - 3, 0)
+    list_height = max(panel_height - 2, 0)
     if selected < top:
         top = selected
     elif selected >= top + list_height:
         top = selected - list_height + 1
-
-    header = f"{'KIND':<{LABEL_COL}} LABEL".ljust(content_width)
-    if panel_y + 1 < height:
-        stdscr.addnstr(panel_y + 1, panel_x + 2, header[:content_width], content_width, curses.A_UNDERLINE)
 
     for row in range(list_height):
         idx = top + row
@@ -1018,7 +1024,7 @@ def draw_stations(stdscr, stations, selected, top, status):  # pylint: disable=t
         kind = "soundcloud" if is_soundcloud_url(station["url"]) else "radio"
         line = f"{kind:<{LABEL_COL}} {station['label']}"
         attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
-        stdscr.addnstr(panel_y + 2 + row, panel_x + 2, line[:content_width], content_width, attr)
+        stdscr.addnstr(panel_y + 1 + row, panel_x + 2, line[:content_width], content_width, attr)
 
     draw_status_bar(stdscr, height - 1, width, status)
     stdscr.refresh()
@@ -1072,7 +1078,7 @@ def draw_tracks(stdscr, tracks, selected, top, status):  # pylint: disable=too-m
         panel_y = 0
         panel_height = max(height - 1, 1)
 
-    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width, title="Tracks")
     draw_top_right(stdscr, 0, width, APP_BRAND)
 
     list_height = max(panel_height - 3, 0)
@@ -1090,7 +1096,8 @@ def draw_tracks(stdscr, tracks, selected, top, status):  # pylint: disable=too-m
         if idx >= len(tracks):
             break
         track = tracks[idx]
-        line = format_row(track["date"], track["duration"], track["artist"], track["title"], content_width)
+        length = format_duration_hms(track["duration_secs"])
+        line = format_row(track["date"], length, track["artist"], track["title"], content_width)
         attr = curses.A_REVERSE if idx == selected else curses.A_NORMAL
         stdscr.addnstr(panel_y + 2 + row, panel_x + 2, line[:content_width], content_width, attr)
 
@@ -1145,7 +1152,7 @@ def draw_playing(stdscr, item, player, status):  # pylint: disable=too-many-loca
     panel_x = max((width - panel_width) // 2, 0)
     panel_y = max((height - 1 - panel_height) // 2, 0)
 
-    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width)
+    draw_panel_border(stdscr, panel_y, panel_x, panel_height, panel_width, title="Player")
     draw_top_right(stdscr, 0, width, APP_BRAND)
 
     row = panel_y + 1
@@ -1169,7 +1176,7 @@ def draw_playing(stdscr, item, player, status):  # pylint: disable=too-many-loca
     if duration_secs:
         suffix = item["duration"]
         bar_width = max(content_width - len(elapsed_str) - len(suffix) - 2, 1)
-        filled = int(min(player.elapsed / duration_secs, 1.0) * bar_width)
+        filled = round(min(player.elapsed / duration_secs, 1.0) * bar_width)
         progress_str = BAR_FILLED * filled + BAR_EMPTY * (bar_width - filled)
     else:
         suffix = "LIVE"

@@ -40,7 +40,6 @@ import tempfile
 import threading
 import time
 import tomllib
-import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -415,76 +414,46 @@ def fetch_and_cache_tracks(station, limit):
     return tracks
 
 
-def resolve_stream_url(track_url):
-    """Resolve a SoundCloud track page URL to a direct audio stream URL.
+def download_track(track_url, dest_path):
+    """Download a SoundCloud track to a local audio file using yt-dlp.
 
-    Prefers a progressive (non-HLS) format: SoundCloud's HLS streams make
-    ffplay fetch a new segment every few seconds, which causes audible
-    stutter/silence at segment boundaries. A plain http stream avoids that.
+    SoundCloud now only offers HLS (m3u8) formats, so the stream URL cannot
+    be fetched directly over plain HTTP; yt-dlp downloads and remuxes the
+    segments into a single file (requires ffmpeg).
 
     Parameters
     ----------
     track_url : str
         URL of the SoundCloud track's webpage.
-
-    Returns
-    -------
-    str
-        Direct, signed URL to the audio stream.
+    dest_path : str or pathlib.Path
+        Local file path to write the download to (overwritten).
 
     Raises
     ------
     subprocess.CalledProcessError
-        If yt-dlp fails to resolve the URL.
+        If yt-dlp fails.
+    OSError
+        If yt-dlp produced no (or an empty) file.
     """
-    proc = subprocess.run(
-        ["yt-dlp", "-f", "bestaudio[protocol=http]/bestaudio", "-g", track_url],
+    subprocess.run(
+        [
+            "yt-dlp",
+            "-f", "bestaudio",
+            "--no-playlist",
+            "--force-overwrites",
+            "-o", str(dest_path),
+            track_url,
+        ],
         capture_output=True,
         text=True,
         check=True,
     )
-    return proc.stdout.strip().splitlines()[0]
-
-
-def download_track(url, dest_path):
-    """Download a track to a local file, verifying it isn't truncated.
-
-    SoundCloud tracks are small (a few MB); downloading up front avoids
-    ffplay's real-time HTTP stream getting cut off mid-track by the CDN.
-    The CDN has occasionally served a short read on a cold cache entry, so
-    the download is verified against ``Content-Length`` rather than trusted
-    blindly.
-
-    Parameters
-    ----------
-    url : str
-        Direct stream URL, as returned by `resolve_stream_url`.
-    dest_path : str or pathlib.Path
-        Local file path to write the download to.
-
-    Raises
-    ------
-    OSError
-        If the download is shorter than the server's advertised
-        ``Content-Length`` (the partial file is removed before raising).
-    """
-    with urllib.request.urlopen(url) as response:
-        expected = response.length
-        with open(dest_path, "wb") as out:
-            shutil.copyfileobj(response, out)
-
-    actual = os.path.getsize(dest_path)
-    if expected is not None and actual != expected:
-        os.remove(dest_path)
-        raise OSError(f"incomplete download: got {actual} of {expected} bytes")
+    if not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        raise OSError("download produced an empty file")
 
 
 def prepare_track(track, attempts=3):
-    """Resolve and download a track to a temp file, retrying on failure.
-
-    The CDN occasionally serves a short read on a cold cache entry (caught
-    by the ``Content-Length`` check in `download_track`); this retries a
-    few times against the same resolved URL before giving up.
+    """Download a track to a temp file, retrying on failure.
 
     Parameters
     ----------
@@ -501,20 +470,17 @@ def prepare_track(track, attempts=3):
 
     Raises
     ------
-    subprocess.CalledProcessError
-        If yt-dlp fails to resolve the stream URL.
-    OSError
-        If all download attempts result in an incomplete file.
+    subprocess.CalledProcessError, OSError
+        If all download attempts fail.
     """
-    stream_url = resolve_stream_url(track["url"])
     last_error = None
     for _ in range(attempts):
-        fd, temp_path = tempfile.mkstemp(suffix=".mp3", prefix="bbplayer_")
+        fd, temp_path = tempfile.mkstemp(suffix=".m4a", prefix="bbplayer_")
         os.close(fd)
         try:
-            download_track(stream_url, temp_path)
+            download_track(track["url"], temp_path)
             return temp_path
-        except OSError as exc:
+        except (OSError, subprocess.CalledProcessError) as exc:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
             last_error = exc
